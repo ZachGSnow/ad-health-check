@@ -1,0 +1,16 @@
+# Health check output names the client's domain, servers and accounts: never commit a run
+*.txt
+*.log
+transcript*
+ad-health*
+
+# Test output
+testResults.xml
+coverage.xml
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
