@@ -121,7 +121,7 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 .\tests\run-tests.ps1
 ```
 
-51 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
+55 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
 health check itself; they load its functions from the parsed file and check:
 
 - OS support decisions, the patch-level verdict, trust delegation bits, ACL rights, table
@@ -135,11 +135,18 @@ health check itself; they load its functions from the parsed file and check:
 **Verified and not verified**
 
 - Version 2.0.0 was run end to end against a production domain during a client review.
-- Version 2.1.0 fixes the issues a code review found in 2.0.0 (patch level by build instead of
-  hotfix date, Windows 11 and Server 2016 support dates, false FAILs for unreachable child
-  domains, custom Entra Connect connector accounts, child-domain PDC time, Server 2025 LDAP
-  signing, lost recurring-issue lines, trust delegation bits). These fixes are covered by the
-  tests above but have **not yet been run against a live domain**.
+- Version 2.1.0 fixes the issues a code review found in 2.0.0. **None of 2.1.0 has been run
+  against a live domain yet.**
+  - Covered by unit tests: patch level by OS build instead of hotfix date, Windows 11 and
+    Server 2016 support dates, and the trust delegation bit.
+  - Parse-checked only, never executed: WARN instead of FAIL when a child domain's DC list
+    cannot be read, child-domain PDC time source, Server 2025 LDAP signing note, member-server
+    lines kept in the summary's recurring issues, Entra Connect path read from the service, the
+    cap on account-creation events, and the DCSync wording.
+- Dated values were checked against Microsoft's pages on 2026-11-14: the October 2026 build
+  floors (Windows Server release information), the Windows 11 servicing dates (Windows 11
+  release information), the trustAttributes bits (MS-ADTS), and the RC4 and Entra Connect
+  dates (KB5073381, Entra Connect version history).
 - Not covered: DCs with a non-English display language, the Entra Connect last-run time
   comparison when the server's time zone is not UTC, and LAPS coverage for computers that
   back up to Entra ID only (they count as missing; the run says so).

@@ -23,6 +23,9 @@ Describe 'Get-OSSupport' {
         @{ OS = 'Windows 11 Pro'; Version = '10.0 (22631)'; Today = '2026-11-14'; Expected = 'EOL (2025-11)' }
         @{ OS = 'Windows 11 Pro'; Version = '10.0 (26200)'; Today = '2026-11-14'; Expected = 'Supported' }
         @{ OS = 'Windows 11 Pro'; Version = '10.0 (28000)'; Today = '2026-11-14'; Expected = 'Supported' }
+        @{ OS = 'Windows 11 Pro'; Version = '10.0 (28000)'; Today = '2028-01-10'; Expected = 'EOS 2028-03-14' }
+        @{ OS = 'Windows 11 Pro'; Version = '10.0 (29500)'; Today = '2026-11-14'; Expected = 'Supported' }
+        @{ OS = 'Windows 11 Enterprise LTSC'; Version = '10.0 (26100)'; Today = '2026-11-14'; Expected = 'Check LTSC' }
         @{ OS = 'Windows 11 Pro'; Version = '10.0 (22500)'; Today = '2026-11-14'; Expected = 'Review' }
         @{ OS = 'Windows 11 Pro'; Version = '10.0'; Today = '2026-11-14'; Expected = 'Review' }
         @{ OS = 'Windows Server 2025 Datacenter'; Version = '10.0 (26100)'; Today = '2026-11-14'; Expected = 'Supported' }
@@ -63,7 +66,8 @@ Describe 'Test-TgtDelegation' {
     It 'is <Expected> for trustAttributes <Value>' -ForEach @(
         @{ Value = 0x800; Expected = $true }
         @{ Value = 0x808; Expected = $true }
-        @{ Value = 0xA00; Expected = $false }
+        @{ Value = 0xA00; Expected = $true }
+        @{ Value = 0x200; Expected = $false }
         @{ Value = 0x8; Expected = $false }
         @{ Value = 0; Expected = $false }
         @{ Value = $null; Expected = $false }

@@ -106,14 +106,18 @@ $Baseline = @{
     EntraConnectMin      = [version]'2.6.84.0'      # required with application-based authentication
     EntraConnectDeadline = [datetime]'2027-04-07'
     Server2016End        = [datetime]'2027-01-12'   # end of extended support
-    # Windows 11 end of servicing per build. HomePro covers Home, Pro, Pro Education and Pro for
-    # Workstations; Enterprise covers Enterprise, Education and IoT Enterprise.
+    # Windows 11 end of servicing per build (Windows 11 release information page, checked 2026-11-14;
+    # 24H2 and older Home/Pro, and 23H2 and older Enterprise, are listed there as "End of updates").
+    # HomePro covers Home, Pro, Pro Education and Pro for Workstations; Enterprise covers
+    # Enterprise, Education and IoT Enterprise. LTSC editions are reported as 'Check LTSC'.
     Win11Servicing       = @{
         22000 = @{ HomePro = [datetime]'2023-10-10'; Enterprise = [datetime]'2024-10-08' }   # 21H2
         22621 = @{ HomePro = [datetime]'2024-10-08'; Enterprise = [datetime]'2025-10-14' }   # 22H2
         22631 = @{ HomePro = [datetime]'2025-11-11'; Enterprise = [datetime]'2026-11-10' }   # 23H2
         26100 = @{ HomePro = [datetime]'2026-10-13'; Enterprise = [datetime]'2027-10-12' }   # 24H2
         26200 = @{ HomePro = [datetime]'2027-10-12'; Enterprise = [datetime]'2028-10-10' }   # 25H2
+        26300 = @{ HomePro = [datetime]'2028-10-10'; Enterprise = [datetime]'2029-10-09' }   # 26H2
+        28000 = @{ HomePro = [datetime]'2028-03-14'; Enterprise = [datetime]'2029-03-13' }   # 26H1
     }
     SupportEndWarnDays   = 180                      # warn this long before an OS leaves support
     MaxDcUptimeDays      = 45
@@ -429,7 +433,7 @@ function Get-OSSupport {
     # 'Check LTSC', 'Review' or 'Unknown'. Dates come from $Baseline.
     if (-not $OS) { return 'Unknown' }
     if ($OS -match 'Server 2003|Server 2008|Server 2012|Windows XP|Windows Vista|Windows 7|Windows 8') { return 'EOL' }
-    if ($OS -match 'Windows 10' -and $OS -match 'LTS') { return 'Check LTSC' }
+    if ($OS -match 'Windows 1[01]' -and $OS -match 'LTS') { return 'Check LTSC' }
     if ($OS -match 'Windows 10') { return 'EOL (Oct 2025)' }
     if ($OS -match 'Server 2016') { return (Get-SupportState $Baseline.Server2016End) }
     if ($OS -match 'Windows 11') {
@@ -460,13 +464,13 @@ function Get-SupportState {
 }
 
 function Test-TgtDelegation {
-    # True when a trust explicitly allows TGT delegation across it:
-    # TRUST_ATTRIBUTE_CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION (0x800) set and
-    # TRUST_ATTRIBUTE_CROSS_ORGANIZATION_NO_TGT_DELEGATION (0x200) not set (trustAttributes bits as documented in MS-ADTS)
+    # True when a trust explicitly allows TGT delegation across it: trustAttributes bit
+    # TRUST_ATTRIBUTE_CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION (0x800). Per MS-ADTS, once KB4490425
+    # is installed this bit supersedes the older NO_TGT_DELEGATION bit (0x200), so 0x200 is ignored.
     param($TrustAttributes)
     if ($null -eq $TrustAttributes -or "$TrustAttributes" -notmatch '^\d+$') { return $false }
     $bits = [int64]"$TrustAttributes"
-    (($bits -band 0x800) -ne 0) -and (($bits -band 0x200) -eq 0)
+    ($bits -band 0x800) -ne 0
 }
 
 function Get-PatchVerdict {
@@ -2263,10 +2267,11 @@ try {
         $first = $group.Group[0]
         Write-Status WARN "$($group.Count) $($first.OS) machine(s) - support ends $($first.Support.Substring(4)): $(Limit-Text (($group.Group | ForEach-Object { $_.Name }) -join ', ') 300)"
     }
-    $review = @($withSupport | Where-Object { $_.Support -eq 'Review' })
-    if ($review) { Write-Status WARN "$($review.Count) active computer(s) on an OS or build this script has no support date for - check them by hand: $(Limit-Text (($review | ForEach-Object { "$($_.Name) ($($_.OS) $($_.Version))" }) -join ', ') 300)" }
+    # Only Windows 11 builds missing from the baseline table; other unlisted systems (NAS, Mac, Linux) stay table-only
+    $review = @($withSupport | Where-Object { $_.Support -eq 'Review' -and $_.OS -match 'Windows 11' })
+    if ($review) { Write-Status WARN "$($review.Count) Windows 11 computer(s) on a build this script has no support date for - check them by hand: $(Limit-Text (($review | ForEach-Object { "$($_.Name) ($($_.Version))" }) -join ', ') 300)" }
     $ltsc = @($withSupport | Where-Object { $_.Support -eq 'Check LTSC' })
-    if ($ltsc) { Write-Status INFO "$($ltsc.Count) Windows 10 LTSC/LTSB machine(s) - confirm LTSC version support dates" }
+    if ($ltsc) { Write-Status INFO "$($ltsc.Count) Windows LTSC/LTSB machine(s) - confirm LTSC version support dates" }
     if (-not $eol -and -not $endingSoon -and -not $review) { Write-Status PASS 'No active computers on end-of-life operating systems' }
 
     Write-Sub 'Servers'
@@ -2702,11 +2707,7 @@ try {
         }
         elseif ($cloudSyncSids -contains $holderSid) { $verdict = 'Entra Cloud Sync agent (expected)' }
         elseif ($script:AdminSids.Contains($holderSid)) { $verdict = 'Already an administrator' }
-        elseif ($canReadHashes -and $holderName -match 'sync|connect|aadc|entra|adds') {
-            # Name suggests a custom Entra Connect AD DS connector account, which legitimately needs these rights
-            $verdict = 'Not a default - looks like a custom Entra Connect connector account; confirm it is one'; $severity = 'WARN'
-        }
-        elseif ($canReadHashes) { $verdict = 'NOT a default - can read every password hash'; $severity = 'FAIL' }
+        elseif ($canReadHashes) { $verdict = 'NOT a default - can read every password hash (expected only for a custom Entra Connect AD DS connector account)'; $severity = 'FAIL' }
         else { $verdict = 'Not a default (partial right)'; $severity = 'WARN' }
         $replicationRows += [pscustomobject]@{ Principal = $holderName; Rights = $holderRights; Verdict = $verdict; Severity = $severity }
     }
