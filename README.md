@@ -121,7 +121,7 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 .\tests\run-tests.ps1
 ```
 
-55 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
+56 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
 health check itself; they load its functions from the parsed file and check:
 
 - OS support decisions, the patch-level verdict, trust delegation bits, ACL rights, table
@@ -131,12 +131,16 @@ health check itself; they load its functions from the parsed file and check:
   read-only arguments, and nothing writes through .NET.
 - That each remote collector is self-contained, so it does not break when it runs on another
   server.
+- That no top-level variable reuses the name of the script's own state (`$counts` is
+  `$script:Counts` at the top level; that clash stopped 2.1.0 after section 5).
 
 **Verified and not verified**
 
 - Version 2.0.0 was run end to end against a production domain during a client review.
-- Version 2.1.0 fixes the issues a code review found in 2.0.0. **None of 2.1.0 has been run
-  against a live domain yet.**
+- Version 2.1.0 ran against a production domain (two Windows Server 2022 DCs) on 2026-11-16.
+  Sections 1-5 completed; the run then stopped on the variable clash fixed in 2.1.1.
+  **Sections 6-22 of 2.1.x have not yet completed on a live domain.**
+- Version 2.1.0 fixes the issues a code review found in 2.0.0.
   - Covered by unit tests: patch level by OS build instead of hotfix date, Windows 11 and
     Server 2016 support dates, and the trust delegation bit.
   - Parse-checked only, never executed: WARN instead of FAIL when a child domain's DC list

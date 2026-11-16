@@ -93,7 +93,7 @@ param(
     [switch]$SkipMemberServers
 )
 
-$ScriptVersion = '2.1.0'
+$ScriptVersion = '2.1.1'
 
 # Dated baselines. Microsoft moves these; review them when the script warns that they are old.
 $Baseline = @{
@@ -1327,10 +1327,10 @@ try {
     if ($rb -and @($rb.EnabledScopes).Count -gt 0) { Write-Status PASS 'AD Recycle Bin is enabled' }
     else { Write-Status WARN 'AD Recycle Bin is NOT enabled (deleted objects cannot be restored with attributes/group memberships)' }
 
-    $tsl = (Get-ADObject "CN=Directory Service,CN=Windows NT,CN=Services,$ConfigNC" -Properties tombstoneLifetime).tombstoneLifetime
-    if (-not $tsl) { $tsl = 60; Write-Status INFO 'Tombstone lifetime not set (defaults to 60 days)' }
-    else { Write-Status INFO "Tombstone lifetime: $tsl days" }
-    $script:TSL = [int]$tsl
+    $tombstoneDays = (Get-ADObject "CN=Directory Service,CN=Windows NT,CN=Services,$ConfigNC" -Properties tombstoneLifetime).tombstoneLifetime
+    if (-not $tombstoneDays) { $tombstoneDays = 60; Write-Status INFO 'Tombstone lifetime not set (defaults to 60 days)' }
+    else { Write-Status INFO "Tombstone lifetime: $tombstoneDays days" }
+    $script:TSL = [int]$tombstoneDays
 
     if ($DCs.Count -eq 1) { Write-Status WARN 'Only ONE domain controller - no AD/DNS redundancy; a DC failure is a full outage' }
     else { Write-Status PASS "$($DCs.Count) domain controllers" }
@@ -1591,17 +1591,17 @@ try {
 
     Write-Sub 'GPO folder count in SYSVOL per DC (should match)'
     $guidRx = '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$'
-    $counts = foreach ($dc in $DCs) {
+    $gpoFolderCounts = foreach ($dc in $DCs) {
         $p = "\\$($dc.HostName)\SYSVOL\$DomDNS\Policies"
         $n = $null
         try { $n = @(Get-ChildItem -LiteralPath $p -Directory | Where-Object { $_.Name -match $guidRx }).Count } catch { }
         [pscustomobject]@{ DC = $dc.Name; PolicyFolders = $(if ($null -eq $n) { 'unreachable' } else { $n }) }
     }
-    Show-Table $counts
-    $distinct = @($counts | Where-Object { $_.PolicyFolders -ne 'unreachable' } | ForEach-Object { $_.PolicyFolders } | Select-Object -Unique)
+    Show-Table $gpoFolderCounts
+    $distinct = @($gpoFolderCounts | Where-Object { $_.PolicyFolders -ne 'unreachable' } | ForEach-Object { $_.PolicyFolders } | Select-Object -Unique)
     if ($distinct.Count -gt 1) { Write-Status WARN 'SYSVOL policy folder counts differ between DCs - SYSVOL is not fully in sync' }
     elseif ($distinct.Count -eq 1) { Write-Status PASS 'SYSVOL policy folder counts match on all reachable DCs' }
-    foreach ($c in $counts) { if ($c.PolicyFolders -eq 'unreachable') { Write-Status FAIL "Cannot read \\$($c.DC)\SYSVOL" } }
+    foreach ($c in $gpoFolderCounts) { if ($c.PolicyFolders -eq 'unreachable') { Write-Status FAIL "Cannot read \\$($c.DC)\SYSVOL" } }
 } catch { Write-Status FAIL "Section error: $($_.Exception.Message)" }
 
 # ---------------------------------------------------------------------------------------------

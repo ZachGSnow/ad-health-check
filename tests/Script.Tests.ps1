@@ -85,3 +85,34 @@ Describe 'Remote collectors' {
         $missing | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Script-scope state' {
+    It 'is never overwritten by a top-level variable of the same name' {
+        # Variable names ignore case, and at the top level of the script $counts IS $script:Counts.
+        # In 2.1.0 the section 5 GPO folder table ($counts) replaced the PASS/WARN/FAIL tally and the
+        # next Write-Status call stopped the run. Top-level code must use different names.
+        $L = [System.Management.Automation.Language.VariableExpressionAst]
+        $state = @($script:Ast.FindAll({ param($n) $n -is $L -and $n.VariablePath.IsScript }, $true) |
+                ForEach-Object { ($_.VariablePath.UserPath -replace '^script:', '').ToLower() } | Sort-Object -Unique)
+        $state.Count | Should -BeGreaterThan 5
+
+        $topLevel = @($script:Ast.FindAll({
+                    param($n)
+                    ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is $L) -or
+                    $n -is [System.Management.Automation.Language.ForEachStatementAst]
+                }, $true) | Where-Object {
+                $p = $_.Parent
+                $isTop = $true
+                while ($p) {
+                    if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst] -or $p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $isTop = $false; break }
+                    $p = $p.Parent
+                }
+                $isTop
+            })
+        $clashes = @(foreach ($node in $topLevel) {
+                if ($node -is [System.Management.Automation.Language.ForEachStatementAst]) { $v = $node.Variable } else { $v = $node.Left }
+                if (-not $v.VariablePath.IsScript -and $state -contains $v.VariablePath.UserPath.ToLower()) { "line $($node.Extent.StartLineNumber): `$$($v.VariablePath.UserPath)" }
+            })
+        $clashes | Should -BeNullOrEmpty
+    }
+}
