@@ -45,7 +45,7 @@ Describe 'Read-only' {
         $readVerbs = '^(Get|Test|Resolve|Select|Sort|Where|ForEach|Group|Measure|Compare|ConvertFrom|ConvertTo|Format|Limit|Show|Expand|Receive|Wait|Join|Out|Import)-'
         $allowed = @(
             'Add-Member', 'New-Object', 'New-PSSession', 'New-PSSessionOption', 'Remove-PSSession', 'Remove-Job', 'Stop-Job',
-            'Invoke-Command', 'Invoke-Native', 'Invoke-OnComputer',
+            'Invoke-Command', 'Invoke-Native', 'Invoke-OnComputer', 'Compress-DcdiagOutput',
             'Write-Host', 'Write-Progress', 'Write-Status', 'Write-Section', 'Write-Sub', 'Write-Info', 'Write-Detail', 'Write-HeaderLines',
             'w32tm.exe', 'auditpol.exe'
         )

@@ -76,6 +76,77 @@ Describe 'Test-TgtDelegation' {
     }
 }
 
+Describe 'Get-ReplicationHint' {
+    It 'gives Exchange groups an Exchange hint, not the Entra Connect one' {
+        $hint = Get-ReplicationHint 'CONTOSO\Exchange Trusted Subsystem' 'NOT a default - can read every password hash'
+        $hint | Should -Match 'Exchange group'
+        $hint | Should -Not -Match 'Entra'
+        Get-ReplicationHint 'CONTOSO\Organization Management' 'NOT a default - can read every password hash' | Should -Match 'Exchange group'
+    }
+    It 'mentions a custom Entra Connect connector only for other full hash readers' {
+        Get-ReplicationHint 'CONTOSO\svc-sync' 'NOT a default - can read every password hash' | Should -Match 'Entra Connect AD DS connector'
+        Get-ReplicationHint 'CONTOSO\helpdesk' 'Not a default (partial right)' | Should -Be 'Remove the permission unless it is known and needed'
+    }
+    It 'tells you to remove leftover sync accounts' {
+        Get-ReplicationHint 'CONTOSO\MSOL_0123456789ab' 'Entra Connect account whose server is gone' | Should -Match 'leftover sync account'
+    }
+}
+
+Describe 'Test-LogCoversWindow' {
+    It 'is <Expected> when the oldest event is <Oldest> for a <Days>-day window' -ForEach @(
+        @{ Oldest = '2026-11-01'; Days = 7; Expected = $true }
+        @{ Oldest = '2026-11-07'; Days = 7; Expected = $true }
+        @{ Oldest = '2026-11-13 21:00'; Days = 7; Expected = $false }
+        @{ Oldest = '2026-11-13 21:00'; Days = 1; Expected = $false }
+    ) {
+        Test-LogCoversWindow -Oldest ([datetime]$Oldest) -Days $Days | Should -Be $Expected
+    }
+    It 'is false when the oldest event is unknown' { Test-LogCoversWindow -Oldest $null -Days 1 | Should -BeFalse }
+}
+
+Describe 'Compress-DcdiagOutput' {
+    BeforeAll {
+        function New-EventBlock([string]$Time, [string]$Target) {
+            '             An error event occurred.  EventID: 0x0000272C'
+            "                Time Generated: 11/16/2026   $Time"
+            '                Event String:'
+            "                DCOM was unable to communicate with the computer $Target using any of the configured protocols; requested by PID 1c54 (C:\Program Files\Example Probe\probe.exe)."
+        }
+        $script:Raw = @(
+            '   Testing server: Default-First-Site-Name\DC01'
+            New-EventBlock '07:50:20' '192.0.2.10'
+            New-EventBlock '07:50:41' '192.0.2.10'
+            New-EventBlock '08:41:48' '192.0.2.1'
+            New-EventBlock '08:46:53' '192.0.2.10'
+            '         ......................... DC01 failed test SystemLog'
+        )
+    }
+
+    It 'collapses repeated events into one block with a count and time range' {
+        $out = @(Compress-DcdiagOutput $script:Raw)
+        @($out | Where-Object { $_ -match 'An error event occurred' }).Count | Should -Be 2
+        ($out | Where-Object { $_ -match '\(x3, first' }) | Should -Match 'first 11/16/2026 07:50:20, last 11/16/2026 08:46:53'
+        @($out | Where-Object { $_ -match '\(x\d' }).Count | Should -Be 1
+    }
+
+    It 'keeps the failed test line, after the events, so the result can still be parsed' {
+        $out = @(Compress-DcdiagOutput $script:Raw)
+        $out[0] | Should -Match 'Testing server'
+        $out[-1] | Should -Match 'DC01 failed test SystemLog'
+    }
+
+    It 'keeps the time of an event that happened once' {
+        $out = @(Compress-DcdiagOutput $script:Raw)
+        $single = [array]::IndexOf($out, ($out | Where-Object { $_ -match '192\.0\.2\.1 ' }))
+        $out[$single - 2] | Should -Match 'Time Generated: 11/16/2026 08:41:48'
+    }
+
+    It 'leaves output without events unchanged' {
+        $plain = @('   Testing server: Default-First-Site-Name\DC01', '         ......................... DC01 passed test Services')
+        @(Compress-DcdiagOutput $plain) | Should -Be $plain
+    }
+}
+
 Describe 'Get-DangerousRights' {
     BeforeAll {
         function New-Rule {

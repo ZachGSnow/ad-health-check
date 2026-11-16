@@ -93,7 +93,7 @@ param(
     [switch]$SkipMemberServers
 )
 
-$ScriptVersion = '2.1.1'
+$ScriptVersion = '2.1.2'
 
 # Dated baselines. Microsoft moves these; review them when the script warns that they are old.
 $Baseline = @{
@@ -471,6 +471,75 @@ function Test-TgtDelegation {
     if ($null -eq $TrustAttributes -or "$TrustAttributes" -notmatch '^\d+$') { return $false }
     $bits = [int64]"$TrustAttributes"
     ($bits -band 0x800) -ne 0
+}
+
+function Get-ReplicationHint {
+    # The advice printed after a DCSync finding, matched to who holds the right
+    param([string]$HolderName, [string]$Verdict)
+    if ($Verdict -match 'server is gone') { return 'Remove the permission and the leftover sync account' }
+    if ($HolderName -match 'Exchange|Organization Management') {
+        return 'This is an Exchange group: confirm with whoever runs Exchange why it holds this right, and remove it if nothing needs it'
+    }
+    if ($Verdict -cmatch 'NOT a default') {
+        return 'Remove the permission unless it is a custom Entra Connect AD DS connector account or otherwise known and needed'
+    }
+    'Remove the permission unless it is known and needed'
+}
+
+function Test-LogCoversWindow {
+    # True when a log's oldest event is at least $Days old, so "nothing found" covers the whole window
+    param($Oldest, [int]$Days)
+    if ($Oldest -isnot [datetime]) { return $false }
+    ($script:Now - $Oldest).TotalDays -ge $Days
+}
+
+function Compress-DcdiagOutput {
+    # dcdiag /e /q prints every matching event in full, so one noisy source can fill the screen.
+    # Collapses event blocks with the same ID and text into one block with a count and a time range;
+    # every other line (the "failed test" lines included) is kept in order.
+    param([string[]]$Lines)
+    $out = New-Object System.Collections.Generic.List[string]
+    $groups = New-Object System.Collections.Specialized.OrderedDictionary
+    $current = $null
+    $flushGroups = {
+        foreach ($g in $groups.Values) {
+            # The header, then when it happened (one time, or a count and range), then the event text
+            $out.Add($g.Lines[0])
+            if ($g.Seen -gt 1) { $out.Add("                (x$($g.Seen), first $($g.First), last $($g.Last))") }
+            elseif ($g.First) { $out.Add("                Time Generated: $($g.First)") }
+            for ($gi = 1; $gi -lt $g.Lines.Count; $gi++) { $out.Add($g.Lines[$gi]) }
+        }
+        $groups.Clear()
+    }
+    $closeBlock = {
+        if ($null -eq $current) { return }
+        $key = ($current.Body -join "`n")
+        if ($groups.Contains($key)) {
+            $groups[$key].Seen++
+            if ($current.Time) { $groups[$key].Last = $current.Time }
+        } else {
+            $groups[$key] = @{ Lines = $current.Body; Seen = 1; First = $current.Time; Last = $current.Time }
+        }
+    }
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*An? (error|warning) event occurred\.') {
+            . $closeBlock
+            $current = @{ Body = New-Object System.Collections.Generic.List[string]; Time = '' }
+            $current.Body.Add($line)
+        } elseif ($null -ne $current -and $line -match '^\s*Time Generated:\s*(.+?)\s*$') {
+            $current.Time = ($Matches[1] -replace '\s+', ' ')
+        } elseif ($null -ne $current -and $line -notmatch '^\s*\.{3,}' -and $line -notmatch '^\s*(Testing|Starting test|Doing )') {
+            $current.Body.Add($line)
+        } else {
+            . $closeBlock
+            $current = $null
+            . $flushGroups
+            $out.Add($line)
+        }
+    }
+    . $closeBlock
+    . $flushGroups
+    $out
 }
 
 function Get-PatchVerdict {
@@ -1480,7 +1549,7 @@ try {
     if ($dd.Count -eq 0) {
         Write-Status PASS 'dcdiag reported no errors on any DC'
     } else {
-        foreach ($l in $dd) { Write-Detail $l }
+        foreach ($l in (Compress-DcdiagOutput $dd)) { Write-Detail $l }
         $noisy = 'SystemLog', 'DFSREvent', 'KccEvent', 'FrsEvent'
         $dcdiagFailures = 0
         foreach ($l in $dd) {
@@ -1967,7 +2036,7 @@ try {
 Write-Section '11. PRIVILEGED / ADMIN-LEVEL ACCESS REVIEW'
 try {
     foreach ($pg in $PrivGroups) {
-        Write-Sub "$($pg.Name)  ($(@($pg.Members).Count) effective member(s), nested groups expanded)"
+        Write-Sub "$($pg.Name)  ($(@($pg.Members | ForEach-Object { $_.DN } | Select-Object -Unique).Count) effective member(s), nested groups expanded)"
         $rows = foreach ($m in $pg.Members) {
             $obj = $UserByDN[$m.DN]; if (-not $obj) { $obj = $CompByDN[$m.DN] }
             $addedTxt = ''
@@ -2474,6 +2543,8 @@ try {
                 if ($sd.LastResult -ne 'success') { Write-Status WARN $msg }
                 elseif ($h -gt 3 -and -not $sd.Staging) { Write-Status WARN "$msg ($h h ago)" }
                 else { Write-Status PASS $msg }
+            } else {
+                Write-Status WARN "$srvName : could not read the last sync run (Get-ADSyncRunProfileResult returned nothing) - check the last run in Synchronization Service Manager"
             }
         } catch { Write-Status WARN "Could not query Entra Connect on $srvName ($($_.Exception.Message)) - check Synchronization Service Manager manually" }
     }
@@ -2540,7 +2611,13 @@ try {
         $ntlmWindow = $EventDays
         if ($f.NtlmWindowDays) { $ntlmWindow = $f.NtlmWindowDays }
         if ([int]$f.NtlmV1Count -gt 0) { Write-Status FAIL "$tag $($f.NtlmV1Count) NTLMv1 logon(s) in the last $ntlmWindow day(s) - $(Limit-Text (@($f.NtlmV1Top) -join '; ') 400)" }
-        else { Write-Status PASS "$tag no NTLMv1 logons in the Security log (last $ntlmWindow day(s), or as far back as the log goes)" }
+        elseif (Test-LogCoversWindow -Oldest $f.SecurityOldest -Days $ntlmWindow) { Write-Status PASS "$tag no NTLMv1 logons in the Security log (last $ntlmWindow day(s))" }
+        else {
+            # A short Security log cannot prove NTLMv1 is unused; the log size finding below says why
+            $coveredHours = '?'
+            if ($f.SecurityOldest -is [datetime]) { $coveredHours = [math]::Round(($Now - $f.SecurityOldest).TotalHours, 0) }
+            Write-Status INFO "$tag no NTLMv1 logons found, but the Security log only covers $coveredHours hour(s) - too short to rule NTLMv1 out"
+        }
         if (-not $f.AuditNtlmInDomain -and -not $f.AuditReceivingNtlm) { Write-Status INFO "$tag NTLM auditing is off. Turn it on to learn what still uses NTLM before Microsoft disables it by default" }
         if ($null -ne $f.BlockNtlmv1SSO -and [int]$f.BlockNtlmv1SSO -eq 0) { Write-Status WARN "$tag BlockNtlmv1SSO is set to 0 (NTLMv1 single sign-on explicitly allowed) - Microsoft treats this as a temporary exception" }
 
@@ -2707,9 +2784,9 @@ try {
         }
         elseif ($cloudSyncSids -contains $holderSid) { $verdict = 'Entra Cloud Sync agent (expected)' }
         elseif ($script:AdminSids.Contains($holderSid)) { $verdict = 'Already an administrator' }
-        elseif ($canReadHashes) { $verdict = 'NOT a default - can read every password hash (expected only for a custom Entra Connect AD DS connector account)'; $severity = 'FAIL' }
+        elseif ($canReadHashes) { $verdict = 'NOT a default - can read every password hash'; $severity = 'FAIL' }
         else { $verdict = 'Not a default (partial right)'; $severity = 'WARN' }
-        $replicationRows += [pscustomobject]@{ Principal = $holderName; Rights = $holderRights; Verdict = $verdict; Severity = $severity }
+        $replicationRows += [pscustomobject]@{ Principal = $holderName; Rights = $holderRights; Verdict = $verdict; Severity = $severity; Hint = (Get-ReplicationHint $holderName $verdict) }
     }
     Show-Table ($replicationRows | Sort-Object Principal | Select-Object -Property 'Principal', 'Rights', 'Verdict') -Flag {
         param($row)
@@ -2718,7 +2795,7 @@ try {
     }
     $replicationIssues = @($replicationRows | Where-Object { $_.Severity })
     foreach ($issue in $replicationIssues) {
-        Write-Status $issue.Severity "DCSync rights - '$($issue.Principal)' holds $($issue.Rights) on the domain ($($issue.Verdict)). Remove the permission unless it is known and needed"
+        Write-Status $issue.Severity "DCSync rights - '$($issue.Principal)' holds $($issue.Rights) on the domain ($($issue.Verdict)). $($issue.Hint)"
     }
     if ($replicationIssues.Count -eq 0) { Write-Status PASS 'Only default principals and current sync accounts hold replication (DCSync) rights' }
     } catch { Write-Status WARN "The DCSync rights check could not finish - $($_.Exception.Message)" }
@@ -2869,7 +2946,7 @@ try {
                 OS           = ("$($srv.OperatingSystem)" -replace 'Windows Server ', '')
                 State        = "$($SrvState[$key])"
                 UptimeDays   = $(if ($facts) { Get-AgeDays $facts.LastBoot } else { '' })
-                LastPatch    = $(if ($facts) { Format-Date $facts.LastPatch } else { '' })
+                LastPatch    = $(if ($facts -and $facts.LastPatch -is [datetime]) { Format-Date $facts.LastPatch } elseif ($facts) { 'unknown' } else { '' })
                 RebootNeeded = $(if ($facts) { $facts.PendingReboot } else { '' })
                 'RAM%'       = $(if ($facts) { $facts.RamUsedPct } else { '' })
                 'CPU%'       = $(if ($facts) { $facts.CpuLoadPct } else { '' })
@@ -2907,7 +2984,8 @@ try {
             $serverUptime = Get-AgeDays $facts.LastBoot
             $serverPatchAge = Get-AgeDays $facts.LastPatch
             if ($null -ne $serverUptime -and $serverUptime -gt $Baseline.MaxDcUptimeDays) { Write-Status WARN "$tag uptime $serverUptime days (last boot $(Format-Date $facts.LastBoot))" }
-            if ($null -ne $serverPatchAge -and $serverPatchAge -gt $Baseline.MaxPatchAgeDays) { Write-Status WARN "$tag last update installed $serverPatchAge days ago ($($facts.LastPatchKB) on $(Format-Date $facts.LastPatch))" }
+            if ($null -eq $serverPatchAge) { Write-Status WARN "$tag could not determine the last patch date (Get-HotFix returned no install dates) - check Windows Update history on the server" }
+            elseif ($serverPatchAge -gt $Baseline.MaxPatchAgeDays) { Write-Status WARN "$tag last update installed $serverPatchAge days ago ($($facts.LastPatchKB) on $(Format-Date $facts.LastPatch))" }
             if ($facts.PendingReboot) { Write-Status WARN "$tag reboot pending" }
             if ($null -ne $facts.RamUsedPct -and $facts.RamUsedPct -ge 95) { Write-Status WARN "$tag memory $($facts.RamUsedPct)% used of $($facts.RamTotalGB) GB" }
 
@@ -3046,7 +3124,9 @@ foreach ($sectionName in $script:SectionOrder) {
     else { Write-Host ('    ' + $scoreLine) -ForegroundColor DarkGreen }
 }
 Write-Host ('    ' + ('-' * 96)) -ForegroundColor DarkGray
-Write-Host ('    {0,-78} {1,5} {2,5}' -f 'TOTAL', $fails.Count, $warns.Count) -ForegroundColor White
+$passTotal = 0
+foreach ($sectionName in $script:SectionOrder) { if ($sectionName -notlike '22.*') { $passTotal += [int]$script:Counts[$sectionName].PASS } }
+Write-Host ('    {0,-78} {1,5} {2,5} {3,5}' -f 'TOTAL', $fails.Count, $warns.Count, $passTotal) -ForegroundColor White
 
 # Action lists: everything that failed first, then everything to review, in report order
 foreach ($grp in 'FAIL', 'WARN') {
