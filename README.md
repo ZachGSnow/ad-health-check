@@ -32,8 +32,10 @@ maps straight onto the review agenda.
   - LDAP signing and channel binding, NTLMv1 use, SMBv1, Print Spooler and audit policy.
   - Kerberos RC4 retirement (KB5073381): accounts limited to old ciphers, service accounts
     without AES keys, and the KDC's RC4 audit events.
-  - AD CS escalation paths ESC1-4, ESC6, ESC8, ESC9, ESC11 and ESC15-16, plus ESC17 (a
-    community-defined path, not a Microsoft one).
+  - AD CS escalation paths ESC1-9, ESC11, ESC13 and ESC15-16, plus ESC17 (a
+    community-defined path, not a Microsoft one): template settings and permissions, the CA's
+    own permissions, issuance policies linked to groups and the permissions on the PKI objects
+    in AD.
   - DCSync rights, dangerous ACLs on key objects, unconstrained delegation and SID history.
   - Entra Connect version and application-based authentication ahead of the 2027-04-07
     deadline.
@@ -121,12 +123,12 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 .\tests\run-tests.ps1
 ```
 
-78 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
+84 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
 health check itself; they load its functions from the parsed file and check:
 
 - OS support decisions, the patch-level verdict, trust delegation bits, ACL rights, the AD CS
-  template rules (ESC1-3, 9, 15, 17), privileged group expansion, table output and the date and
-  name helpers.
+  template rules (ESC1-3, 9, 13, 15, 17), reading a CA's own permissions (ESC7), privileged
+  group expansion, table output and the date and name helpers.
 - That the script parses, is plain ASCII and has help for every parameter.
 - That it is read-only: every command it calls is on a reviewed list, native tools only get
   read-only arguments, and nothing writes through .NET.
@@ -161,6 +163,10 @@ health check itself; they load its functions from the parsed file and check:
   group such as Domain Users nested in an admin group) and parse-checked otherwise (DNS servers of
   other domains in the forest accepted, ping-blocked servers no longer FAIL when LDAP, RPC or WinRM
   answers, unreadable GPO reports shown as unknown). None of them has run on a live domain yet.
+- The ESC5, ESC7 and ESC13 checks are unit tested where they are a function (the ESC13 template
+  rule, decoding the CA's permissions) and parse-checked otherwise (reading the issuance policy
+  links, reading the CA's registry over WinRM, the permissions on the PKI objects in AD). None has
+  run against a live CA yet.
 - Not covered: DCs with a non-English display language, the Entra Connect last-run time
   comparison when the server's time zone is not UTC, and LAPS coverage for computers that
   back up to Entra ID only (they count as missing; the run says so).
