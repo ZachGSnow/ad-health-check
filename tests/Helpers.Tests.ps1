@@ -258,6 +258,47 @@ Describe 'Get-TemplateEscProblems' {
         @(Get-TemplateEscProblems -Ekus $clientAuth -EnrollmentFlag 0x80000 -SchemaVersion 2) -join ';' | Should -Match 'ESC9'
         @(Get-TemplateEscProblems -Ekus $serverAuth -NameFlag 1 -EnrollmentFlag 2 -SchemaVersion 1) -join ';' | Should -Match 'ESC15'
     }
+    It 'flags ESC13 when a logon template carries an issuance policy linked to a group' {
+        $links = @{ '1.3.6.1.4.1.311.21.8.1.2.3' = 'Tier0-Logon' }
+        $found = @(Get-TemplateEscProblems -Ekus $clientAuth -SchemaVersion 2 -IssuancePolicies '1.3.6.1.4.1.311.21.8.1.2.3' -PolicyGroupLinks $links) -join ';'
+        $found | Should -Match "^ESC13 - issuance policy 1\.3\.6\.1\.4\.1\.311\.21\.8\.1\.2\.3 is linked to group 'Tier0-Logon'"
+    }
+    It 'stays quiet on ESC13 when the policy is not linked, approval is needed or the certificate cannot log on' {
+        $links = @{ '1.3.6.1.4.1.311.21.8.1.2.3' = 'Tier0-Logon' }
+        @(Get-TemplateEscProblems -Ekus $clientAuth -SchemaVersion 2 -IssuancePolicies '1.3.6.1.4.1.311.21.8.9.9.9' -PolicyGroupLinks $links).Count | Should -Be 0
+        @(Get-TemplateEscProblems -Ekus $clientAuth -EnrollmentFlag 2 -SchemaVersion 2 -IssuancePolicies '1.3.6.1.4.1.311.21.8.1.2.3' -PolicyGroupLinks $links).Count | Should -Be 0
+        @(Get-TemplateEscProblems -Ekus $serverAuth -SchemaVersion 2 -IssuancePolicies '1.3.6.1.4.1.311.21.8.1.2.3' -PolicyGroupLinks $links).Count | Should -Be 0
+    }
+}
+
+Describe 'Get-CaAccessProblems' {
+    BeforeAll {
+        # A CA keeps its permissions as a binary security descriptor; build one from SDDL
+        function ConvertTo-DescriptorBytes([string]$Sddl) {
+            $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor $Sddl
+            $bytes = New-Object byte[] $descriptor.BinaryLength
+            $descriptor.GetBinaryForm($bytes, 0)
+            , $bytes
+        }
+    }
+
+    It 'names Manage CA and Issue and Manage Certificates for each principal' {
+        $found = @(Get-CaAccessProblems -SecurityDescriptor (ConvertTo-DescriptorBytes 'O:BAG:BAD:(A;;0x3;;;BA)(A;;0x2;;;S-1-5-21-1-2-3-1105)(A;;0x200;;;AU)'))
+        $found.Count | Should -Be 2
+        ($found | Where-Object { $_.Sid -eq 'S-1-5-32-544' }).Rights | Should -Be @('Manage CA', 'Issue and Manage Certificates')
+        ($found | Where-Object { $_.Sid -eq 'S-1-5-21-1-2-3-1105' }).Rights | Should -Be @('Issue and Manage Certificates')
+    }
+    It 'ignores read and enroll rights and deny entries' {
+        @(Get-CaAccessProblems -SecurityDescriptor (ConvertTo-DescriptorBytes 'O:BAG:BAD:(D;;0x1;;;S-1-5-21-1-2-3-1106)(A;;0x300;;;AU)')).Count | Should -Be 0
+    }
+    It 'merges several entries for the same principal' {
+        $found = @(Get-CaAccessProblems -SecurityDescriptor (ConvertTo-DescriptorBytes 'O:BAG:BAD:(A;;0x1;;;S-1-5-21-1-2-3-1107)(A;;0x2;;;S-1-5-21-1-2-3-1107)'))
+        $found.Count | Should -Be 1
+        $found[0].Rights | Should -Be @('Manage CA', 'Issue and Manage Certificates')
+    }
+    It 'returns nothing for an empty descriptor' {
+        @(Get-CaAccessProblems -SecurityDescriptor @()).Count | Should -Be 0
+    }
 }
 
 Describe 'Expand-PrivGroup' {

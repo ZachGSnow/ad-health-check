@@ -631,7 +631,9 @@ function Get-TemplateEscProblems {
         [int64]$NameFlag = 0,                   # msPKI-Certificate-Name-Flag
         [int64]$EnrollmentFlag = 0,             # msPKI-Enrollment-Flag
         [int]$RaSignatures = 0,                 # msPKI-RA-Signature
-        [int]$SchemaVersion = 0                 # msPKI-Template-Schema-Version
+        [int]$SchemaVersion = 0,                # msPKI-Template-Schema-Version
+        [string[]]$IssuancePolicies = @(),      # msPKI-Certificate-Policy
+        [hashtable]$PolicyGroupLinks = @{}      # issuance policy OID -> name of the group it is linked to
     )
     $logonEkus = '1.3.6.1.5.5.7.3.2', '1.3.6.1.5.2.3.4', '1.3.6.1.4.1.311.20.2.2', '2.5.29.37.0'
     $ekuList = @($Ekus | Where-Object { $_ })
@@ -658,13 +660,42 @@ function Get-TemplateEscProblems {
     if ($noSecurityExtension -and $logonCapable) { $problems += 'ESC9 - the security extension is switched off on a logon-capable template' }
     if ($SchemaVersion -eq 1 -and $requesterSetsSubject) { $problems += 'ESC15 - version 1 template where the requester chooses the subject (the CA needs the November 2024 update)' }
     if ($noGate -and $requesterSetsSubject -and $serverAuth -and -not $logonCapable) { $problems += 'ESC17 (community-defined, not a Microsoft ESC) - the requester chooses the subject on a server-authentication template' }
+    # An issuance policy linked to a group (msDS-OIDToGroupLink) adds that group to the logon token of
+    # whoever logs on with the certificate, so enrolling is the same as joining the group
+    if ($noGate -and $logonCapable) {
+        foreach ($policy in @($IssuancePolicies | Where-Object { $_ } | ForEach-Object { "$_" } | Select-Object -Unique)) {
+            if ($PolicyGroupLinks.ContainsKey($policy)) { $problems += "ESC13 - issuance policy $policy is linked to group '$($PolicyGroupLinks[$policy])', so whoever logs on with the certificate gets that group's rights" }
+        }
+    }
     return $problems
+}
+
+function Get-CaAccessProblems {
+    # Who a CA's own permissions (the binary Security value under its CertSvc\Configuration
+    # registry key) let manage the CA (Manage CA, 0x1) or approve and revoke certificates
+    # (Issue and Manage Certificates, 0x2) - the rights behind ESC7. One entry per principal;
+    # the caller leaves out administrators. Deny entries are ignored.
+    param([byte[]]$SecurityDescriptor)
+    $bySid = [ordered]@{}
+    if (-not $SecurityDescriptor -or $SecurityDescriptor.Count -eq 0) { return @() }
+    $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor -ArgumentList $SecurityDescriptor, 0
+    foreach ($ace in @($descriptor.DiscretionaryAcl)) {
+        if ("$($ace.AceQualifier)" -ne 'AccessAllowed') { continue }
+        $sid = "$($ace.SecurityIdentifier.Value)"
+        if (-not $bySid.Contains($sid)) { $bySid[$sid] = New-Object System.Collections.Generic.List[string] }
+        if (($ace.AccessMask -band 1) -ne 0 -and -not $bySid[$sid].Contains('Manage CA')) { $bySid[$sid].Add('Manage CA') }
+        if (($ace.AccessMask -band 2) -ne 0 -and -not $bySid[$sid].Contains('Issue and Manage Certificates')) { $bySid[$sid].Add('Issue and Manage Certificates') }
+    }
+    @(foreach ($sid in $bySid.Keys) {
+        if ($bySid[$sid].Count -gt 0) { [pscustomobject]@{ Sid = $sid; Rights = @($bySid[$sid]) } }
+    })
 }
 
 function Test-AclTarget {
     # Reports non-admin principals that hold high-impact rights on one AD object.
     # Returns the number of findings so the caller can print a PASS when there are none.
-    param([string]$DN, [string]$Label, [switch]$IncludeInherited, [switch]$CheckOwner)
+    # -AlsoSafe lists SIDs that rightly hold such rights on this object only (a CA's own computer account).
+    param([string]$DN, [string]$Label, [switch]$IncludeInherited, [switch]$CheckOwner, [string[]]$AlsoSafe = @())
     $found = 0
     try { $acl = Get-AdAcl -DN $DN -Server $PDC } catch {
         Write-Status WARN "$($Label): could not read its permissions - $($_.Exception.Message)"
@@ -675,7 +706,7 @@ function Test-AclTarget {
         if ($rule.IsInherited -and -not $IncludeInherited) { continue }
         $sid = "$($rule.IdentityReference.Value)"
         $class = Get-SidClass $sid
-        if ($class -eq 'Safe') { continue }
+        if ($class -eq 'Safe' -or $AlsoSafe -contains $sid) { continue }
         $rights = @(Get-DangerousRights $rule)
         if ($rights.Count -eq 0) { continue }
         # Rules that only apply to objects underneath are still reported, and labelled as such
@@ -698,7 +729,7 @@ function Test-AclTarget {
     }
     if ($CheckOwner -and $acl.Owner) {
         $ownerClass = Get-SidClass $acl.Owner
-        if ($ownerClass -ne 'Safe') {
+        if ($ownerClass -ne 'Safe' -and $AlsoSafe -notcontains $acl.Owner) {
             $found++
             $severity = 'WARN'
             if ($ownerClass -eq 'Unsafe') { $severity = 'FAIL' }
@@ -2463,7 +2494,20 @@ try {
         foreach ($ca in $CAs) {
             foreach ($templateName in @($ca.certificateTemplates)) { if ($templateName) { [void]$publishedTemplates.Add("$templateName") } }
         }
-        $templates = @(Get-ADObject -SearchBase "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC" -LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties 'displayName', 'pKIExtendedKeyUsage', 'msPKI-Certificate-Application-Policy', 'msPKI-Certificate-Name-Flag', 'msPKI-Enrollment-Flag', 'msPKI-RA-Signature', 'msPKI-Template-Schema-Version' -Server $PDC)
+        # Issuance policies linked to a group (ESC13). The link itself is legitimate (authentication
+        # mechanism assurance); it becomes a path when a template anyone can enroll in carries the policy.
+        $policyGroupLinks = @{}
+        try {
+            $linkedPolicies = @(Get-ADObject -SearchBase "CN=OID,CN=Public Key Services,CN=Services,$ConfigNC" -LDAPFilter '(&(objectClass=msPKI-Enterprise-Oid)(msDS-OIDToGroupLink=*))' -Properties 'displayName', 'msPKI-Cert-Template-OID', 'msDS-OIDToGroupLink' -Server $PDC)
+            foreach ($linkedPolicy in $linkedPolicies) {
+                $policyOid = "$($linkedPolicy.'msPKI-Cert-Template-OID')"
+                $linkedGroup = Get-CnFromDN "$($linkedPolicy.'msDS-OIDToGroupLink')"
+                if (-not $policyOid -or -not $linkedGroup) { continue }
+                $policyGroupLinks[$policyOid] = $linkedGroup
+                Write-Status INFO "Issuance policy '$($linkedPolicy.displayName)' ($policyOid) is linked to group '$linkedGroup' - logging on with a certificate that carries it adds that group's rights"
+            }
+        } catch { Write-Status INFO "Could not read the issuance policies (CN=OID), so ESC13 was not checked - $($_.Exception.Message)" }
+        $templates = @(Get-ADObject -SearchBase "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC" -LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties 'displayName', 'pKIExtendedKeyUsage', 'msPKI-Certificate-Application-Policy', 'msPKI-Certificate-Policy', 'msPKI-Certificate-Name-Flag', 'msPKI-Enrollment-Flag', 'msPKI-RA-Signature', 'msPKI-Template-Schema-Version' -Server $PDC)
         $templateFindings = 0
         $templatesChecked = 0
         foreach ($tpl in $templates) {
@@ -2492,7 +2536,7 @@ try {
             if ($null -ne $tpl.'msPKI-Enrollment-Flag') { $enrollFlag = [int64]$tpl.'msPKI-Enrollment-Flag' }
             if ($null -ne $tpl.'msPKI-RA-Signature') { $raSignatures = [int]$tpl.'msPKI-RA-Signature' }
             if ($null -ne $tpl.'msPKI-Template-Schema-Version') { $schemaVersion = [int]$tpl.'msPKI-Template-Schema-Version' }
-            $problems = @(Get-TemplateEscProblems -Ekus @($tpl.pKIExtendedKeyUsage) -ApplicationPolicies @($tpl.'msPKI-Certificate-Application-Policy') -NameFlag $nameFlag -EnrollmentFlag $enrollFlag -RaSignatures $raSignatures -SchemaVersion $schemaVersion)
+            $problems = @(Get-TemplateEscProblems -Ekus @($tpl.pKIExtendedKeyUsage) -ApplicationPolicies @($tpl.'msPKI-Certificate-Application-Policy') -NameFlag $nameFlag -EnrollmentFlag $enrollFlag -RaSignatures $raSignatures -SchemaVersion $schemaVersion -IssuancePolicies @($tpl.'msPKI-Certificate-Policy') -PolicyGroupLinks $policyGroupLinks)
 
             if ($problems.Count -gt 0 -and $enrollers.Count -gt 0) {
                 $templateFindings++
@@ -2542,7 +2586,50 @@ try {
                 $webEnrollment = Invoke-OnComputer -ComputerName $ca.dNSHostName -ScriptBlock { [bool](Get-WindowsFeature -Name ADCS-Web-Enrollment -ErrorAction SilentlyContinue).Installed } -TimeoutSec 60
                 if ($webEnrollment) { Write-Status WARN "$caLabel - ESC8: web enrollment (/certsrv) is installed. Confirm it is HTTPS-only with Extended Protection, or remove it" }
             } catch { }
+
+            # ESC7: the CA's own permissions live in its registry, not in AD. Manage CA lets the holder
+            # switch on ESC6 or publish any template; Issue and Manage Certificates lets them approve requests.
+            try {
+                $caSecurity = [byte[]]@(Invoke-OnComputer -ComputerName $ca.dNSHostName -TimeoutSec 60 -ScriptBlock {
+                    $configKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration'
+                    $activeCa = (Get-ItemProperty -Path $configKey -Name Active -ErrorAction Stop).Active
+                    , [byte[]](Get-ItemProperty -Path "$configKey\$activeCa" -Name Security -ErrorAction Stop).Security
+                })
+                if ($caSecurity.Count -eq 0) { throw 'the CA registry key has no Security value' }
+                $caHolders = @(Get-CaAccessProblems -SecurityDescriptor $caSecurity | Where-Object { (Get-SidClass $_.Sid) -ne 'Safe' })
+                if ($caHolders.Count -eq 0) { Write-Status PASS "$caLabel - only administrators can manage the CA or approve certificate requests (ESC7 not present)" }
+                foreach ($holder in $caHolders) {
+                    $severity = 'WARN'
+                    if ((Get-SidClass $holder.Sid) -eq 'Unsafe') { $severity = 'FAIL' }
+                    Write-Status $severity "$caLabel - ESC7: '$(Resolve-SidName $holder.Sid)' has $($holder.Rights -join ' and ') on the CA"
+                }
+            } catch { Write-Status INFO "$caLabel - could not read the CA's own permissions over WinRM, so ESC7 was not checked - $($_.Exception.Message)" }
         }
+
+        # ESC5: rights over the AD objects AD CS trusts. Whoever can change them can add a CA
+        # certificate to NTAuth, rewrite templates and issuance policies, or take over a CA server.
+        Write-Sub 'Permissions on the AD CS objects (ESC5)'
+        $pkiBase = "CN=Public Key Services,CN=Services,$ConfigNC"
+        $pkiFindings = 0
+        foreach ($pkiTarget in @(
+                @{ DN = $pkiBase; Label = 'Public Key Services container' }
+                @{ DN = "CN=Certificate Templates,$pkiBase"; Label = 'Certificate Templates container' }
+                @{ DN = "CN=Enrollment Services,$pkiBase"; Label = 'Enrollment Services container' }
+                @{ DN = "CN=OID,$pkiBase"; Label = 'OID container (issuance policies)' }
+                @{ DN = "CN=NTAuthCertificates,$pkiBase"; Label = 'NTAuthCertificates' }
+            )) {
+            $pkiFindings += Test-AclTarget -DN $pkiTarget.DN -Label $pkiTarget.Label -CheckOwner
+        }
+        foreach ($ca in $CAs) {
+            # A CA's own computer account rightly manages its enrollment object in AD
+            $caComputer = $AllComputers | Where-Object { "$($_.DNSHostName)" -eq "$($ca.dNSHostName)" } | Select-Object -First 1
+            $caComputerSid = @()
+            if ($caComputer) { $caComputerSid = @("$($caComputer.SID.Value)") }
+            $pkiFindings += Test-AclTarget -DN "$($ca.DistinguishedName)" -Label "CA object '$($ca.Name)'" -CheckOwner -AlsoSafe $caComputerSid
+            if ($caComputer) { $pkiFindings += Test-AclTarget -DN "$($caComputer.DistinguishedName)" -Label "CA server computer account $($caComputer.Name)" -CheckOwner }
+            else { Write-Status INFO "CA server $($ca.dNSHostName) has no computer account in $DomDNS, so the permissions on that account were not checked" }
+        }
+        if ($pkiFindings -eq 0) { Write-Status PASS "No non-admin principal can change the AD CS containers, NTAuthCertificates, the CA objects or the CA servers' computer accounts" }
     }
 
     Write-Sub 'Entra Connect (directory sync)'
