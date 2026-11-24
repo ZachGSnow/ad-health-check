@@ -622,6 +622,45 @@ function Get-DangerousRights {
     return $granted
 }
 
+function Get-TemplateEscProblems {
+    # The AD CS escalation paths a published certificate template opens through its own settings.
+    # Who may enroll is checked by the caller. Returns one short description per path found.
+    param(
+        [string[]]$Ekus = @(),                  # pKIExtendedKeyUsage
+        [string[]]$ApplicationPolicies = @(),   # msPKI-Certificate-Application-Policy
+        [int64]$NameFlag = 0,                   # msPKI-Certificate-Name-Flag
+        [int64]$EnrollmentFlag = 0,             # msPKI-Enrollment-Flag
+        [int]$RaSignatures = 0,                 # msPKI-RA-Signature
+        [int]$SchemaVersion = 0                 # msPKI-Template-Schema-Version
+    )
+    $logonEkus = '1.3.6.1.5.5.7.3.2', '1.3.6.1.5.2.3.4', '1.3.6.1.4.1.311.20.2.2', '2.5.29.37.0'
+    $ekuList = @($Ekus | Where-Object { $_ })
+    # Version 2+ templates also list application policies, which Windows honours for logon, so a
+    # purpose in either list counts. No EKU at all still means any purpose.
+    $purposes = @($ekuList + @($ApplicationPolicies | Where-Object { $_ }))
+    $requesterSetsSubject = (($NameFlag -band 1) -ne 0)
+    # CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME (0x10000): the requester supplies the subject
+    # alternative name, which is enough to name another user in the certificate
+    $requesterSetsSan     = (($NameFlag -band 0x10000) -ne 0)
+    $needsApproval        = (($EnrollmentFlag -band 2) -ne 0)
+    $noSecurityExtension  = (($EnrollmentFlag -band 0x80000) -ne 0)
+    $noGate               = (-not $needsApproval) -and ($RaSignatures -eq 0)
+    $logonCapable         = ($ekuList.Count -eq 0) -or (@($purposes | Where-Object { $logonEkus -contains $_ }).Count -gt 0)
+    $anyPurpose           = ($ekuList.Count -eq 0) -or ($purposes -contains '2.5.29.37.0')
+    $enrollmentAgent      = ($purposes -contains '1.3.6.1.4.1.311.20.2.1')
+    $serverAuth           = ($purposes -contains '1.3.6.1.5.5.7.3.1')
+
+    $problems = @()
+    if ($noGate -and $requesterSetsSubject -and $logonCapable) { $problems += 'ESC1 - the requester chooses the subject name and the certificate can be used to log on' }
+    elseif ($noGate -and $requesterSetsSan -and $logonCapable) { $problems += 'ESC1 - the requester supplies the subject alternative name and the certificate can be used to log on' }
+    elseif ($noGate -and $anyPurpose) { $problems += 'ESC2 - any-purpose certificate issued without approval' }
+    if ($noGate -and $enrollmentAgent) { $problems += 'ESC3 - enrollment agent certificate issued without approval' }
+    if ($noSecurityExtension -and $logonCapable) { $problems += 'ESC9 - the security extension is switched off on a logon-capable template' }
+    if ($SchemaVersion -eq 1 -and $requesterSetsSubject) { $problems += 'ESC15 - version 1 template where the requester chooses the subject (the CA needs the November 2024 update)' }
+    if ($noGate -and $requesterSetsSubject -and $serverAuth -and -not $logonCapable) { $problems += 'ESC17 (community-defined, not a Microsoft ESC) - the requester chooses the subject on a server-authentication template' }
+    return $problems
+}
+
 function Test-AclTarget {
     # Reports non-admin principals that hold high-impact rights on one AD object.
     # Returns the number of findings so the caller can print a PASS when there are none.
@@ -1046,11 +1085,18 @@ $WritableDCs = @($DCs | Where-Object { -not $_.IsReadOnly })
 try { $RootDomain = Get-ADDomain -Identity $Forest.RootDomain -Server $Forest.RootDomain } catch { $RootDomain = $Domain }
 $RootSID = $RootDomain.DomainSID.Value
 
-# All DC names in the forest (for metadata checks)
+# All DC names and addresses in the forest (for metadata checks, and because a DC or client may
+# rightly use a DC of another domain in the forest for DNS)
 $ForestDCNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$ForestDcIPs   = New-Object 'System.Collections.Generic.HashSet[string]'
 $UnreachableDomains = New-Object System.Collections.Generic.List[string]
 foreach ($d in $Forest.Domains) {
-    try { Get-ADDomainController -Filter * -Server $d -ErrorAction Stop | ForEach-Object { [void]$ForestDCNames.Add($_.Name) } } catch { $UnreachableDomains.Add("$d") }
+    try {
+        Get-ADDomainController -Filter * -Server $d -ErrorAction Stop | ForEach-Object {
+            [void]$ForestDCNames.Add($_.Name)
+            if ($_.IPv4Address) { [void]$ForestDcIPs.Add("$($_.IPv4Address)") }
+        }
+    } catch { $UnreachableDomains.Add("$d") }
 }
 # When a domain could not be listed, "not a current DC" may only mean "in a domain we could not read"
 $UnverifiedNote = ''
@@ -1078,6 +1124,8 @@ foreach ($dc in $DCs) {
     }
 }
 $DcIPs = @(@($DCs | ForEach-Object { "$($_.IPv4Address)" }) + @($DCFacts.Values | Where-Object { $_ } | ForEach-Object { $_.IPs }) | Where-Object { $_ } | Select-Object -Unique)
+# Every address an AD DNS server in this forest answers on (this domain's DCs plus the other domains' DCs)
+$AdDnsIPs = @(@($DcIPs) + @($ForestDcIPs) | Where-Object { $_ } | Select-Object -Unique)
 
 # Time offsets relative to the PDC
 Write-Progress -Activity $act -Status 'Measuring DC clock offsets'
@@ -1114,6 +1162,11 @@ $CompByDN = @{}; foreach ($c in $AllComputers) { $CompByDN[$c.DistinguishedName]
 $DCNameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($dc in $DCs) { [void]$DCNameSet.Add($dc.Name) }
 
+# Principals that stand for everyone (or every user or computer). Used to classify permissions
+# (section 19 and AD CS) and to catch one of them nested inside an admin group.
+$script:UnsafeSids = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($s in 'S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-5-2', 'S-1-5-4', 'S-1-5-32-545', 'S-1-5-32-546', 'S-1-0-0', "$DomSID-513", "$DomSID-514", "$DomSID-515") { [void]$script:UnsafeSids.Add($s) }
+
 # Privileged groups (by SID so renamed/localised groups still resolve)
 Write-Progress -Activity $act -Status 'Expanding privileged groups'
 function Expand-PrivGroup {
@@ -1127,18 +1180,25 @@ function Expand-PrivGroup {
             $out += [pscustomobject]@{ DN = $m; Name = $m; Sam = ''; Class = 'unresolved'; Via = $Path; Sid = '' }
             continue
         }
-        if ($o.objectClass -eq 'group') {
+        if ($o.objectClass -eq 'group' -and $script:UnsafeSids.Contains("$($o.objectSid)")) {
+            # Domain Users and the like get most members from primaryGroupID, not 'member', so expanding
+            # them would show almost nobody. Report the group itself: everyone in it holds this access.
+            $out += [pscustomobject]@{ DN = $o.DistinguishedName; Name = $o.Name; Sam = $o.sAMAccountName; Class = 'group (everyone in it)'; Via = $Path; Sid = "$($o.objectSid)" }
+        } elseif ($o.objectClass -eq 'group') {
             if ($Seen.Add($o.DistinguishedName)) {
                 $out += Expand-PrivGroup -GroupDN $o.DistinguishedName -Path "$Path > $($o.Name)" -Seen $Seen
             }
         } else {
-            $name = $o.Name
-            $sid  = "$($o.objectSid)"
+            $name  = $o.Name
+            $sid   = "$($o.objectSid)"
+            $class = $o.objectClass
             if ($o.objectClass -eq 'foreignSecurityPrincipal') {
                 $sid = "$($o.Name)"
                 try { $name = ([System.Security.Principal.SecurityIdentifier]$o.Name).Translate([System.Security.Principal.NTAccount]).Value } catch { }
+                # Everyone, Authenticated Users and similar are stored as foreign security principals
+                if ($script:UnsafeSids.Contains($sid)) { $class = 'well-known group (everyone in it)' }
             }
-            $out += [pscustomobject]@{ DN = $o.DistinguishedName; Name = $name; Sam = $o.sAMAccountName; Class = $o.objectClass; Via = $Path; Sid = $sid }
+            $out += [pscustomobject]@{ DN = $o.DistinguishedName; Name = $name; Sam = $o.sAMAccountName; Class = $class; Via = $Path; Sid = $sid }
         }
     }
     $out
@@ -1200,18 +1260,17 @@ foreach ($pg in $PrivGroups) {
     }
 }
 
-# Principal classes for the permission checks (section 19 and AD CS)
-$script:UnsafeSids = New-Object 'System.Collections.Generic.HashSet[string]'
-foreach ($s in 'S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-5-32-545', 'S-1-0-0', "$DomSID-513", "$DomSID-515") { [void]$script:UnsafeSids.Add($s) }
+# Principal classes for the permission checks (section 19 and AD CS); $script:UnsafeSids is set above
 $script:SafeSids = New-Object 'System.Collections.Generic.HashSet[string]'
 foreach ($s in 'S-1-5-18', 'S-1-5-10', 'S-1-3-0', 'S-1-5-9', 'S-1-5-32-544', 'S-1-5-32-548', 'S-1-5-32-549', 'S-1-5-32-550', 'S-1-5-32-551',
     "$DomSID-500", "$DomSID-512", "$DomSID-516", "$DomSID-517", "$DomSID-521", "$DomSID-526",
     "$RootSID-500", "$RootSID-512", "$RootSID-518", "$RootSID-519", "$RootSID-498", "$RootSID-527") { [void]$script:SafeSids.Add($s) }
-# Accounts that are already full administrators: rights they hold are not an escalation path
+# Accounts that are already full administrators: rights they hold are not an escalation path.
+# A broad group found inside an admin group is reported in section 11 and is never treated as safe here.
 $script:AdminSids = New-Object 'System.Collections.Generic.HashSet[string]'
 foreach ($pg in $PrivGroups) {
     if ($pg.Key -ne 'Domain Admins' -and $pg.Key -ne 'Enterprise Admins' -and $pg.Key -ne 'Administrators') { continue }
-    foreach ($m in $pg.Members) { if ($m.Sid) { [void]$script:AdminSids.Add($m.Sid) } }
+    foreach ($m in $pg.Members) { if ($m.Sid -and -not $script:UnsafeSids.Contains($m.Sid)) { [void]$script:AdminSids.Add($m.Sid) } }
 }
 
 # Accurate last logon for privileged accounts: lastLogon is not replicated, so ask every DC and keep the newest
@@ -1413,11 +1472,13 @@ try {
         [pscustomobject]@{ Role = 'Infrastructure Master'; Holder = $Domain.InfrastructureMaster }
     )
     foreach ($f in $fsmo) {
-        $f | Add-Member -NotePropertyName Online -NotePropertyValue (Test-Ping $f.Holder)
+        # Ping first, then LDAP: a DC behind a firewall that drops ICMP is still online
+        $online = (Test-Ping $f.Holder) -or (Test-TcpPort -ComputerName $f.Holder -Port 389 -TimeoutMs 2000)
+        $f | Add-Member -NotePropertyName Online -NotePropertyValue $online
     }
     Show-Table $fsmo -Flag { param($row) if (-not $row.Online) { 'FAIL' } }
     foreach ($f in $fsmo) {
-        if (-not $f.Online) { Write-Status FAIL "FSMO holder for $($f.Role) ($($f.Holder)) does not respond to ping" }
+        if (-not $f.Online) { Write-Status FAIL "FSMO holder for $($f.Role) ($($f.Holder)) does not respond to ping or LDAP (TCP 389)" }
         elseif (-not $ForestDCNames.Contains((Get-ShortName $f.Holder))) {
             if ($UnverifiedNote) { Write-Status WARN "$($f.Role) holder $($f.Holder) was not found in the DC list$UnverifiedNote" }
             else { Write-Status FAIL "$($f.Role) holder $($f.Holder) is not a current DC (seize/transfer needed)" }
@@ -1437,7 +1498,7 @@ try {
                 Virtual = $(if ($DCFacts[$_.Name]) { $DCFacts[$_.Name].IsVirtual } else { '?' })
                 Roles   = (@($_.OperationMasterRoles) | ForEach-Object { "$_" -replace 'Master|Emulator', '' }) -join ','
             }
-        }) -Flag { param($row) if (-not $row.Ping) { 'FAIL' } }
+        }) -Flag { param($row) if (-not $row.Ping -and "$($row.Virtual)" -eq '?') { 'FAIL' } }
 
     Write-Sub 'Sites and subnets'
     $sites   = @(Get-ADReplicationSite -Filter * -Server $PDC)
@@ -1477,8 +1538,10 @@ foreach ($dc in $DCs) {
     try {
         $tag = $dc.Name + ':'
         Write-Sub "$($dc.HostName)  ($($dc.OperatingSystem))"
-        if ($Ping[$dc.Name]) { Write-Status PASS "$tag responds to ping" } else { Write-Status FAIL "$tag does not respond to ping" }
         $f = $DCFacts[$dc.Name]
+        if ($Ping[$dc.Name]) { Write-Status PASS "$tag responds to ping" }
+        elseif ($f) { Write-Status INFO "$tag does not answer ping (ICMP blocked?), but answered over WinRM" }
+        else { Write-Status FAIL "$tag does not respond to ping" }
         if (-not $f) { Write-Status FAIL "$tag could not collect data over WinRM - $($DCErrors[$dc.Name])"; continue }
 
         $up = Get-AgeDays $f.LastBoot
@@ -1748,8 +1811,8 @@ try {
         foreach ($nic in $f.DnsClient) {
             $servers  = @($nic.Servers)
             $list     = $servers -join ', '
-            $external = @($servers | Where-Object { $_ -notin $DcIPs -and $_ -ne '127.0.0.1' -and $_ -ne '::1' })
-            $partners = @($servers | Where-Object { $_ -notin $own -and $_ -in $DcIPs })
+            $external = @($servers | Where-Object { $_ -notin $AdDnsIPs -and $_ -ne '127.0.0.1' -and $_ -ne '::1' })
+            $partners = @($servers | Where-Object { $_ -notin $own -and $_ -in $AdDnsIPs })
             if ($external) { Write-Status FAIL "$($dc.Name) [$($nic.Interface)]: uses non-DC DNS server(s) $($external -join ', ') (DCs must only use AD DNS) - list: $list" }
             elseif ($DCs.Count -gt 1 -and $partners.Count -eq 0) { Write-Status WARN "$($dc.Name) [$($nic.Interface)]: points only to itself ($list) - add a partner DC (partner first, own IP/loopback second)" }
             else { Write-Status PASS "$($dc.Name) [$($nic.Interface)]: $list" }
@@ -1870,10 +1933,12 @@ try {
     $seenScopes = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($key in @(@($DhcpData.Keys) + @($DhcpErr.Keys) | Select-Object -Unique)) {
         Write-Sub "DHCP server: $key"
-        if ($DhcpPing.ContainsKey($key)) {
-            if ($DhcpPing[$key]) { Write-Status PASS "$key responds to ping" } else { Write-Status FAIL "DHCP server $key does not respond to ping" }
-        }
         $d = $DhcpData[$key]
+        if ($DhcpPing.ContainsKey($key)) {
+            if ($DhcpPing[$key]) { Write-Status PASS "$key responds to ping" }
+            elseif ($d) { Write-Status INFO "DHCP server $key does not answer ping (ICMP blocked?), but answered over WinRM" }
+            else { Write-Status FAIL "DHCP server $key does not respond to ping" }
+        }
         if (-not $d) { Write-Status WARN "Could not collect DHCP data from $($key): $(Limit-Text $DhcpErr[$key] 160)"; continue }
 
         if ($d.IsDC -and -not $d.DnsCredUser) { Write-Status WARN 'DHCP runs on a DC with no DNS dynamic-update credentials set (records get owned by the DC account; set a dedicated account)' }
@@ -1909,7 +1974,7 @@ try {
             }
             if (-not $s.DNS006) { Write-Status WARN "Scope $($s.ScopeId) hands out no DNS servers (option 006)" }
             else {
-                $nonDc = @(($s.DNS006 -split ',') | Where-Object { $_ -and $_ -notin $DcIPs })
+                $nonDc = @(($s.DNS006 -split ',') | Where-Object { $_ -and $_ -notin $AdDnsIPs })
                 if ($nonDc) { Write-Status WARN "Scope $($s.ScopeId) hands out non-DC DNS server(s) $($nonDc -join ', ') - domain clients need AD DNS" }
             }
         }
@@ -2050,7 +2115,14 @@ try {
                 Added   = $addedTxt
             }
         }
-        Show-Table $rows -Flag { param($row) if ("$($row.Enabled)" -eq 'False' -or "$($row.Type)" -eq 'unresolved') { 'WARN' } }
+        Show-Table $rows -Flag {
+            param($row)
+            if ("$($row.Type)" -like '*everyone in it*') { 'FAIL' }
+            elseif ("$($row.Enabled)" -eq 'False' -or "$($row.Type)" -eq 'unresolved') { 'WARN' }
+        }
+        foreach ($broadMember in @($pg.Members | Where-Object { $_.Sid -and $script:UnsafeSids.Contains($_.Sid) })) {
+            Write-Status FAIL "$($pg.Name) contains '$($broadMember.Name)' (via $($broadMember.Via)), so every account in it holds $($pg.Name) rights - remove it"
+        }
         if ($pg.ShouldBeEmpty -and @($pg.Members).Count -gt 0) {
             Write-Status WARN "$($pg.Name) has $(@($pg.Members).Count) member(s) - this group should normally be empty"
         }
@@ -2235,7 +2307,8 @@ try {
         $total = [math]::Max($lapsTargets.Count, 1)
         $pct = [math]::Round(100 * ($winL + $legL) / $total, 0)
         Write-Info "Schema: Windows LAPS=$HasWinLaps, legacy LAPS=$HasLegacyLaps   |   Windows LAPS: $winL   Legacy LAPS: $legL   None: $($none.Count)   of $($lapsTargets.Count)  ($pct% covered)"
-        if ($pct -lt 90) { Write-Status WARN "LAPS coverage $pct% - missing on: $(Limit-Text ($none -join ', ') 400)" } else { Write-Status PASS "LAPS coverage $pct%" }
+        if ($lapsTargets.Count -eq 0) { Write-Status INFO "No enabled non-DC Windows computer has logged on in the last $StaleDays days, so there is no LAPS coverage to measure" }
+        elseif ($pct -lt 90) { Write-Status WARN "LAPS coverage $pct% - missing on: $(Limit-Text ($none -join ', ') 400)" } else { Write-Status PASS "LAPS coverage $pct%" }
         if ($none.Count -gt 0 -and $HasWinLaps) { Write-Status INFO 'Computers that back up Windows LAPS to Entra ID only have no AD attribute and are counted as None here - check those in Entra' }
         if ($legL -gt 0) { Write-Status INFO "$legL computer(s) still on legacy Microsoft LAPS - plan migration to Windows LAPS" }
     }
@@ -2248,37 +2321,47 @@ try {
     Import-Module GroupPolicy
     $gpos = @(Get-GPO -All -Domain $DomDNS -Server $PDC)
     $gpoRows = foreach ($g in $gpos) {
-        $links = @(); $hasC = $false; $hasU = $false
+        $links = @(); $hasC = $false; $hasU = $false; $reportRead = $false
         try {
             [xml]$x = Get-GPOReport -Guid $g.Id -ReportType Xml -Domain $DomDNS -Server $PDC
             $links = @($x.GPO.LinksTo | Where-Object { $_ })
             $hasC = [bool]$x.GPO.Computer.ExtensionData
             $hasU = [bool]$x.GPO.User.ExtensionData
+            $reportRead = $true
         } catch { }
         $enabledLinks = @($links | Where-Object { "$($_.Enabled)" -eq 'true' })
         $verOk = ($g.Computer.DSVersion -eq $g.Computer.SysvolVersion) -and ($g.User.DSVersion -eq $g.User.SysvolVersion)
+        # Without its report a GPO's links and settings are unknown, not zero
+        $linkText = '?'; $settingsText = '?'
+        if ($reportRead) {
+            $linkText = "$($enabledLinks.Count)/$($links.Count)"
+            $settingsText = (@($(if ($hasC) { 'C' }), $(if ($hasU) { 'U' })) | Where-Object { $_ }) -join '+'
+        }
         [pscustomobject]@{
             Name      = Limit-Text $g.DisplayName 45
             Status    = "$($g.GpoStatus)"
-            Links     = "$($enabledLinks.Count)/$($links.Count)"
-            Settings  = (@($(if ($hasC) { 'C' }), $(if ($hasU) { 'U' })) | Where-Object { $_ }) -join '+'
+            Links     = $linkText
+            Settings  = $settingsText
             Modified  = $g.ModificationTime.ToString('yyyy-MM-dd')
             VersionOK = $verOk
             LinkedTo  = Limit-Text ((@($links | ForEach-Object { $_.SOMPath })) -join '; ') 60
             _Id       = "{$($g.Id.ToString().ToUpper())}"
             _Full     = $g.DisplayName
             _Enabled  = $enabledLinks.Count
+            _Read     = $reportRead
         }
     }
     Show-Table ($gpoRows | Sort-Object Name | Select-Object -Property 'Name', 'Status', 'Links', 'Settings', 'Modified', 'VersionOK', 'LinkedTo') -Flag {
         param($row)
-        if ("$($row.VersionOK)" -eq 'False' -or "$($row.Links)" -like '0/*') { 'WARN' }
+        if ("$($row.VersionOK)" -eq 'False' -or "$($row.Links)" -like '0/*' -or "$($row.Links)" -eq '?') { 'WARN' }
     }
     Write-Status INFO "$($gpos.Count) GPOs"
 
-    $unlinked = @($gpoRows | Where-Object { $_._Enabled -eq 0 })
+    $unreadable = @($gpoRows | Where-Object { -not $_._Read })
+    if ($unreadable) { Write-Status WARN "$($unreadable.Count) GPO report(s) could not be read, so their links and settings are unknown ('?' above): $(($unreadable | ForEach-Object { $_._Full }) -join '; ')" }
+    $unlinked = @($gpoRows | Where-Object { $_._Read -and $_._Enabled -eq 0 })
     if ($unlinked) { Write-Status WARN "$($unlinked.Count) GPO(s) not linked anywhere (or all links disabled): $(($unlinked | ForEach-Object { $_._Full }) -join '; ')" }
-    $empty = @($gpoRows | Where-Object { -not $_.Settings })
+    $empty = @($gpoRows | Where-Object { $_._Read -and -not $_.Settings })
     if ($empty) { Write-Status INFO "$($empty.Count) empty GPO(s): $(($empty | ForEach-Object { $_._Full }) -join '; ')" }
     foreach ($g in @($gpoRows | Where-Object { -not $_.VersionOK })) { Write-Status WARN "GPO '$($g._Full)' AD and SYSVOL versions differ (replication issue or mid-edit)" }
     foreach ($g in @($gpoRows | Where-Object { $_.Status -eq 'AllSettingsDisabled' })) { Write-Status INFO "GPO '$($g._Full)' has all settings disabled" }
@@ -2358,7 +2441,8 @@ try {
             try { $certs += New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, [byte[]]$bytes) } catch { }
         }
         $newest = $certs | Sort-Object NotAfter -Descending | Select-Object -First 1
-        $reach = Test-Ping $ca.dNSHostName
+        # Ping, then the RPC endpoint mapper that certificate enrollment uses
+        $reach = (Test-Ping $ca.dNSHostName) -or (Test-TcpPort -ComputerName $ca.dNSHostName -Port 135 -TimeoutMs 2000)
         $onDc = $DCNameSet.Contains((Get-ShortName $ca.dNSHostName))
         if (-not $newest) { Write-Status WARN "CA '$($ca.Name)' on $($ca.dNSHostName): could not read CA certificate" }
         else {
@@ -2366,7 +2450,7 @@ try {
             $msg = "CA '$($ca.Name)' on $($ca.dNSHostName): certificate expires $(Format-Date $newest.NotAfter) ($days days)"
             if ($days -lt 0) { Write-Status FAIL $msg } elseif ($days -lt 180) { Write-Status WARN $msg } else { Write-Status PASS $msg }
         }
-        if (-not $reach) { Write-Status WARN "CA host $($ca.dNSHostName) does not respond to ping" }
+        if (-not $reach) { Write-Status WARN "CA host $($ca.dNSHostName) does not respond to ping or RPC (TCP 135) - certificate enrollment cannot reach it" }
         if ($onDc) { Write-Status INFO "CA '$($ca.Name)' is installed on a domain controller (not best practice)" }
     }
 
@@ -2375,12 +2459,11 @@ try {
         # (the "ESC" escalation paths). Only templates a CA actually publishes are checked.
         Write-Sub 'Certificate templates and CA settings (AD CS escalation paths)'
         $enrollGuid    = '0e10c968-78fb-11d2-90d4-00c04f79dc55'
-        $logonEkus     = '1.3.6.1.5.5.7.3.2', '1.3.6.1.5.2.3.4', '1.3.6.1.4.1.311.20.2.2', '2.5.29.37.0'
         $publishedTemplates = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($ca in $CAs) {
             foreach ($templateName in @($ca.certificateTemplates)) { if ($templateName) { [void]$publishedTemplates.Add("$templateName") } }
         }
-        $templates = @(Get-ADObject -SearchBase "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC" -LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties 'displayName', 'pKIExtendedKeyUsage', 'msPKI-Certificate-Name-Flag', 'msPKI-Enrollment-Flag', 'msPKI-RA-Signature', 'msPKI-Template-Schema-Version' -Server $PDC)
+        $templates = @(Get-ADObject -SearchBase "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC" -LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties 'displayName', 'pKIExtendedKeyUsage', 'msPKI-Certificate-Application-Policy', 'msPKI-Certificate-Name-Flag', 'msPKI-Enrollment-Flag', 'msPKI-RA-Signature', 'msPKI-Template-Schema-Version' -Server $PDC)
         $templateFindings = 0
         $templatesChecked = 0
         foreach ($tpl in $templates) {
@@ -2404,28 +2487,12 @@ try {
                 if ($editRights.Count -gt 0) { $editors[$ruleSid] = $ruleClass }
             }
 
-            $ekus = @($tpl.pKIExtendedKeyUsage | Where-Object { $_ } | ForEach-Object { "$_" })
             $nameFlag = [int64]0; $enrollFlag = [int64]0; $raSignatures = 0; $schemaVersion = 0
             if ($null -ne $tpl.'msPKI-Certificate-Name-Flag') { $nameFlag = [int64]$tpl.'msPKI-Certificate-Name-Flag' }
             if ($null -ne $tpl.'msPKI-Enrollment-Flag') { $enrollFlag = [int64]$tpl.'msPKI-Enrollment-Flag' }
             if ($null -ne $tpl.'msPKI-RA-Signature') { $raSignatures = [int]$tpl.'msPKI-RA-Signature' }
             if ($null -ne $tpl.'msPKI-Template-Schema-Version') { $schemaVersion = [int]$tpl.'msPKI-Template-Schema-Version' }
-            $requesterSetsSubject = (($nameFlag -band 1) -ne 0)
-            $needsApproval        = (($enrollFlag -band 2) -ne 0)
-            $noSecurityExtension  = (($enrollFlag -band 524288) -ne 0)
-            $noGate               = (-not $needsApproval) -and ($raSignatures -eq 0)
-            $logonCapable         = ($ekus.Count -eq 0) -or (@($ekus | Where-Object { $logonEkus -contains $_ }).Count -gt 0)
-            $anyPurpose           = ($ekus.Count -eq 0) -or ($ekus -contains '2.5.29.37.0')
-            $enrollmentAgent      = ($ekus -contains '1.3.6.1.4.1.311.20.2.1')
-            $serverAuth           = ($ekus -contains '1.3.6.1.5.5.7.3.1')
-
-            $problems = @()
-            if ($noGate -and $requesterSetsSubject -and $logonCapable) { $problems += 'ESC1 - the requester chooses the subject name and the certificate can be used to log on' }
-            elseif ($noGate -and $anyPurpose) { $problems += 'ESC2 - any-purpose certificate issued without approval' }
-            if ($noGate -and $enrollmentAgent) { $problems += 'ESC3 - enrollment agent certificate issued without approval' }
-            if ($noSecurityExtension -and $logonCapable) { $problems += 'ESC9 - the security extension is switched off on a logon-capable template' }
-            if ($schemaVersion -eq 1 -and $requesterSetsSubject) { $problems += 'ESC15 - version 1 template where the requester chooses the subject (the CA needs the November 2024 update)' }
-            if ($noGate -and $requesterSetsSubject -and $serverAuth -and -not $logonCapable) { $problems += 'ESC17 (community-defined, not a Microsoft ESC) - the requester chooses the subject on a server-authentication template' }
+            $problems = @(Get-TemplateEscProblems -Ekus @($tpl.pKIExtendedKeyUsage) -ApplicationPolicies @($tpl.'msPKI-Certificate-Application-Policy') -NameFlag $nameFlag -EnrollmentFlag $enrollFlag -RaSignatures $raSignatures -SchemaVersion $schemaVersion)
 
             if ($problems.Count -gt 0 -and $enrollers.Count -gt 0) {
                 $templateFindings++
