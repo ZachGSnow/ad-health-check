@@ -229,3 +229,73 @@ Describe 'Show-Table' {
         $out[0] | Should -Be '    (none)'
     }
 }
+
+Describe 'Get-TemplateEscProblems' {
+    BeforeAll { $clientAuth = '1.3.6.1.5.5.7.3.2'; $serverAuth = '1.3.6.1.5.5.7.3.1' }
+
+    It 'flags ESC1 when the requester chooses the subject on a logon template' {
+        @(Get-TemplateEscProblems -Ekus $clientAuth -NameFlag 1 -SchemaVersion 2) -join ';' | Should -Match '^ESC1 - the requester chooses the subject'
+    }
+    It 'flags ESC1 when the requester supplies only the subject alternative name' {
+        @(Get-TemplateEscProblems -Ekus $clientAuth -NameFlag 0x10000 -SchemaVersion 2) -join ';' | Should -Match 'ESC1 - the requester supplies the subject alternative name'
+    }
+    It 'counts a logon purpose found only in the application policies' {
+        @(Get-TemplateEscProblems -Ekus $serverAuth -ApplicationPolicies $clientAuth -NameFlag 1 -SchemaVersion 2) -join ';' | Should -Match 'ESC1'
+    }
+    It 'stays quiet when manager approval or an authorised signature is required' {
+        @(Get-TemplateEscProblems -Ekus $clientAuth -NameFlag 1 -EnrollmentFlag 2 -SchemaVersion 2).Count | Should -Be 0
+        @(Get-TemplateEscProblems -Ekus $clientAuth -NameFlag 1 -RaSignatures 1 -SchemaVersion 2).Count | Should -Be 0
+    }
+    It 'treats a template with no EKU as any purpose (ESC2)' {
+        @(Get-TemplateEscProblems -SchemaVersion 2) -join ';' | Should -Match 'ESC2'
+    }
+    It 'reports ESC17, not ESC1, for a server-only template where the requester sets the subject' {
+        $found = @(Get-TemplateEscProblems -Ekus $serverAuth -NameFlag 1 -SchemaVersion 2) -join ';'
+        $found | Should -Match 'ESC17'
+        $found | Should -Not -Match 'ESC1 '
+    }
+    It 'reports ESC9 and ESC15 from their flags' {
+        @(Get-TemplateEscProblems -Ekus $clientAuth -EnrollmentFlag 0x80000 -SchemaVersion 2) -join ';' | Should -Match 'ESC9'
+        @(Get-TemplateEscProblems -Ekus $serverAuth -NameFlag 1 -EnrollmentFlag 2 -SchemaVersion 1) -join ';' | Should -Match 'ESC15'
+    }
+}
+
+Describe 'Expand-PrivGroup' {
+    BeforeAll {
+        $script:DomSID = 'S-1-5-21-1-2-3'
+        $script:DomDNS = 'contoso.com'
+        $script:PDC = 'dc01.contoso.com'
+        $script:UnsafeSids = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($s in 'S-1-1-0', 'S-1-5-11', "$($script:DomSID)-513") { [void]$script:UnsafeSids.Add($s) }
+        $script:Directory = @{
+            'CN=Admins,DC=contoso,DC=com'       = [pscustomobject]@{ DistinguishedName = 'CN=Admins,DC=contoso,DC=com'; Name = 'Admins'; objectClass = 'group'; sAMAccountName = 'Admins'; objectSid = "$($script:DomSID)-512"
+                                                     member = @('CN=Domain Users,CN=Users,DC=contoso,DC=com', 'CN=S-1-5-11,CN=ForeignSecurityPrincipals,DC=contoso,DC=com', 'CN=Helpdesk,DC=contoso,DC=com') }
+            'CN=Domain Users,CN=Users,DC=contoso,DC=com' = [pscustomobject]@{ DistinguishedName = 'CN=Domain Users,CN=Users,DC=contoso,DC=com'; Name = 'Domain Users'; objectClass = 'group'; sAMAccountName = 'Domain Users'; objectSid = "$($script:DomSID)-513"; member = @('CN=Jordan,DC=contoso,DC=com') }
+            'CN=S-1-5-11,CN=ForeignSecurityPrincipals,DC=contoso,DC=com' = [pscustomobject]@{ DistinguishedName = 'CN=S-1-5-11,CN=ForeignSecurityPrincipals,DC=contoso,DC=com'; Name = 'S-1-5-11'; objectClass = 'foreignSecurityPrincipal'; sAMAccountName = $null; objectSid = $null }
+            'CN=Helpdesk,DC=contoso,DC=com'     = [pscustomobject]@{ DistinguishedName = 'CN=Helpdesk,DC=contoso,DC=com'; Name = 'Helpdesk'; objectClass = 'group'; sAMAccountName = 'Helpdesk'; objectSid = "$($script:DomSID)-1105"; member = @('CN=Jordan,DC=contoso,DC=com') }
+            'CN=Jordan,DC=contoso,DC=com'       = [pscustomobject]@{ DistinguishedName = 'CN=Jordan,DC=contoso,DC=com'; Name = 'Jordan'; objectClass = 'user'; sAMAccountName = 'jordan'; objectSid = "$($script:DomSID)-1106" }
+        }
+        # Stand-ins for the ActiveDirectory module cmdlets, which CI does not have
+        function Get-ADGroup { param($Identity, $Server, $Properties) $script:Directory[$Identity] }
+        function Get-ADObject { param($Identity, $Server, $Properties) $script:Directory[$Identity] }
+    }
+
+    It 'reports a nested broad group as one member instead of expanding it' {
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $members = @(Expand-PrivGroup -GroupDN 'CN=Admins,DC=contoso,DC=com' -Path 'Admins' -Seen $seen)
+        $domainUsers = @($members | Where-Object { $_.Name -eq 'Domain Users' })
+        $domainUsers.Count | Should -Be 1
+        $domainUsers[0].Class | Should -Be 'group (everyone in it)'
+        $domainUsers[0].Sid | Should -Be "$($script:DomSID)-513"
+    }
+    It 'marks Authenticated Users stored as a foreign security principal' {
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $fsp = @(Expand-PrivGroup -GroupDN 'CN=Admins,DC=contoso,DC=com' -Path 'Admins' -Seen $seen) | Where-Object { $_.Sid -eq 'S-1-5-11' }
+        $fsp.Class | Should -Be 'well-known group (everyone in it)'
+    }
+    It 'still expands ordinary nested groups' {
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $jordan = @(Expand-PrivGroup -GroupDN 'CN=Admins,DC=contoso,DC=com' -Path 'Admins' -Seen $seen) | Where-Object { $_.Sam -eq 'jordan' }
+        $jordan.Via | Should -Be 'Admins > Helpdesk'
+    }
+}

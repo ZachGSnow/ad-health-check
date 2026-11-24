@@ -121,11 +121,12 @@ Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPubl
 .\tests\run-tests.ps1
 ```
 
-68 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
+78 Pester tests run in CI on Windows PowerShell 5.1 and PowerShell 7. They never run the
 health check itself; they load its functions from the parsed file and check:
 
-- OS support decisions, the patch-level verdict, trust delegation bits, ACL rights, table
-  output and the date and name helpers.
+- OS support decisions, the patch-level verdict, trust delegation bits, ACL rights, the AD CS
+  template rules (ESC1-3, 9, 15, 17), privileged group expansion, table output and the date and
+  name helpers.
 - That the script parses, is plain ASCII and has help for every parameter.
 - That it is read-only: every command it calls is on a reviewed list, native tools only get
   read-only arguments, and nothing writes through .NET.
@@ -156,6 +157,10 @@ health check itself; they load its functions from the parsed file and check:
   floors (Windows Server release information), the Windows 11 servicing dates (Windows 11
   release information), the trustAttributes bits (MS-ADTS), and the RC4 and Entra Connect
   dates (KB5073381, Entra Connect version history).
+- The fixes after 2.1.2 are unit tested where they are a function (AD CS template rules, a broad
+  group such as Domain Users nested in an admin group) and parse-checked otherwise (DNS servers of
+  other domains in the forest accepted, ping-blocked servers no longer FAIL when LDAP, RPC or WinRM
+  answers, unreadable GPO reports shown as unknown). None of them has run on a live domain yet.
 - Not covered: DCs with a non-English display language, the Entra Connect last-run time
   comparison when the server's time zone is not UTC, and LAPS coverage for computers that
   back up to Entra ID only (they count as missing; the run says so).
